@@ -1,9 +1,7 @@
 import os
 import re
 import msal
-import uuid
 import pandas as pd
-import requests
 import streamlit as st
 from anthropic import Anthropic
 from docx import Document
@@ -43,33 +41,58 @@ if "memory" not in st.session_state:
 if "vector_store" not in st.session_state:
     st.session_state.vector_store = []
 
-# ================= SSO LOGIN =================
+# ================= LOGIN MODES =================
+USE_SSO = False  # ✅ Change to True when admin consent is available
+
 def microsoft_login():
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+    try:
+        app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+        flow = app.initiate_device_flow(scopes=SCOPES)
 
-    flow = app.initiate_device_flow(scopes=SCOPES)
+        if "user_code" not in flow:
+            st.error("Login failed")
+            return
 
-    if "user_code" not in flow:
-        st.error("Login failed")
-        return
+        st.info(f"Go to {flow['verification_uri']}")
+        st.info(f"Enter code: {flow['user_code']}")
 
-    st.info(f"Go to {flow['verification_uri']}")
-    st.info(f"Enter code: {flow['user_code']}")
+        result = app.acquire_token_by_device_flow(flow)
 
-    result = app.acquire_token_by_device_flow(flow)
+        if "access_token" in result:
+            st.session_state.auth = True
+            st.session_state.user = result.get("id_token_claims", {}).get("name", "User")
+            st.rerun()
+        else:
+            st.error("Login failed")
 
-    if "access_token" in result:
-        st.session_state.auth = True
-        st.session_state.user = result["id_token_claims"]["name"]
-        st.rerun()
-    else:
-        st.error("Login failed")
+    except Exception as e:
+        st.error(f"SSO Error: {e}")
 
-# LOGIN UI
+# ================= LOGIN UI =================
 if not st.session_state.auth:
-    st.subheader("🔐 Microsoft Login")
-    if st.button("Login with Microsoft"):
-        microsoft_login()
+
+    if USE_SSO:
+        st.subheader("🔐 Microsoft Login")
+        if st.button("Login with Microsoft"):
+            microsoft_login()
+
+    else:
+        st.subheader("🔐 Basic Login")
+
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+
+        VALID_USER = os.getenv("APP_USER", "admin")
+        VALID_PASS = os.getenv("APP_PASS", "admin123")
+
+        if st.button("Login"):
+            if username == VALID_USER and password == VALID_PASS:
+                st.session_state.auth = True
+                st.session_state.user = username
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+
     st.stop()
 
 st.success(f"✅ Logged in as {st.session_state.user}")
@@ -86,7 +109,7 @@ def extract_file(file):
             )
 
         if file.name.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file)
+            df = pd.read_excel(file, engine="openpyxl")
             return df.to_string()
 
         return file.read().decode("utf-8", "ignore")
@@ -107,13 +130,13 @@ def retrieve_context(query):
     for chunk in st.session_state.vector_store:
         if any(word in chunk.lower() for word in query.lower().split()):
             relevant.append(chunk)
-
     return "\n".join(relevant[:5])
 
-# ================= PROMPT ENGINE =================
+# ================= PROMPT =================
 def build_prompt(query):
     rag_context = retrieve_context(query)
-    conversation = "\n".join(
+
+    memory_context = "\n".join(
         [f"{m['role']}: {m['content']}" for m in st.session_state.memory[-5:]]
     )
 
@@ -121,7 +144,7 @@ def build_prompt(query):
 You are an enterprise AI copilot.
 
 Conversation Memory:
-{conversation}
+{memory_context}
 
 Retrieved Context:
 {rag_context}
@@ -131,13 +154,14 @@ User Query:
 
 Instructions:
 - Answer completely
-- Do not stop mid response
-- If needed, continue automatically
+- NEVER stop mid-response
+- Continue automatically if needed
+- Provide structured output when useful
 """
 
-# ================= AI ENGINE =================
+# ================= AI =================
 def call_ai(prompt):
-    full_response = ""
+    final_output = ""
     current_prompt = prompt
 
     for _ in range(5):
@@ -149,17 +173,17 @@ def call_ai(prompt):
             )
 
             chunk = res.content[0].text
-            full_response += chunk
+            final_output += chunk
 
             if len(chunk) < 200:
                 break
 
-            current_prompt = "Continue from where you stopped."
+            current_prompt = "Continue exactly from where you stopped."
 
         except Exception as e:
-            return f"Error: {e}"
+            return f"AI Error: {e}"
 
-    return full_response
+    return final_output
 
 # ================= FILE UPLOAD =================
 st.subheader("📂 Upload Knowledge")
@@ -168,8 +192,8 @@ files = st.file_uploader("Upload documents", accept_multiple_files=True)
 
 if files:
     for f in files:
-        content = extract_file(f)
-        store_chunks(content)
+        text = extract_file(f)
+        store_chunks(text)
 
     st.success("✅ Knowledge Base Updated")
 
@@ -186,7 +210,6 @@ if query:
     st.session_state.memory.append({"role": "user", "content": query})
 
     prompt = build_prompt(query)
-
     response = call_ai(prompt)
 
     st.session_state.history.append({"role": "assistant", "content": response})
