@@ -24,23 +24,22 @@ if not ANTHROPIC_API_KEY:
     st.error("❌ Missing ANTHROPIC_API_KEY (check Streamlit Secrets)")
     st.stop()
 
-if not CLIENT_ID or not TENANT_ID:
-    st.error("❌ Missing CLIENT_ID or TENANT_ID (check Streamlit Secrets)")
-    st.stop()
-
-# ✅ Safe init
+# ✅ Anthropic init (safe)
 try:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 except Exception as e:
     st.error(f"❌ Failed to initialize AI client: {e}")
     st.stop()
 
+# ✅ Microsoft config validation (NON-BLOCKING)
+graph_enabled = True
+if not CLIENT_ID or not TENANT_ID:
+    graph_enabled = False
+    st.warning("⚠️ Microsoft integration disabled (CLIENT_ID / TENANT_ID missing)")
+
 # ================= SESSION =================
 if "auth" not in st.session_state:
     st.session_state.auth = False
-
-if "usage_log" not in st.session_state:
-    st.session_state.usage_log = []
 
 if "context" not in st.session_state:
     st.session_state.context = ""
@@ -117,38 +116,42 @@ def extract_file(file):
 
 # ================= GRAPH API =================
 def get_graph_token():
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
-    flow = app.initiate_device_flow(scopes=SCOPES)
+    try:
+        app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+        flow = app.initiate_device_flow(scopes=SCOPES)
 
-    if "user_code" not in flow:
-        st.error("❌ Login start failed")
+        if "user_code" not in flow:
+            st.error("❌ Login start failed")
+            return None
+
+        st.info(f"👉 Open: {flow['verification_uri']}")
+        st.info(f"👉 Enter Code: {flow['user_code']}")
+
+        result = app.acquire_token_by_device_flow(flow)
+
+        if "access_token" in result:
+            return result["access_token"]
+
+        st.error("❌ Login failed")
         return None
 
-    st.info(f"👉 Open: {flow['verification_uri']}")
-    st.info(f"👉 Enter Code: {flow['user_code']}")
-
-    result = app.acquire_token_by_device_flow(flow)
-
-    if "access_token" in result:
-        return result["access_token"]
-
-    st.error("❌ Login failed")
-    return None
+    except Exception as e:
+        st.error(f"❌ Microsoft Login Error: {e}")
+        return None
 
 
 def list_drive_items(token, folder_id=None):
     headers = {"Authorization": f"Bearer {token}"}
-
     try:
-        if folder_id:
-            url = f"https://graph.microsoft.com/v1.0/me/drive/items/{folder_id}/children"
-        else:
-            url = "https://graph.microsoft.com/v1.0/me/drive/root/children"
+        url = (
+            f"https://graph.microsoft.com/v1.0/me/drive/items/{folder_id}/children"
+            if folder_id
+            else "https://graph.microsoft.com/v1.0/me/drive/root/children"
+        )
 
         res = requests.get(url, headers=headers)
 
         if res.status_code != 200:
-            st.warning("⚠️ Failed to fetch files")
             return []
 
         return res.json().get("value", [])
@@ -156,22 +159,6 @@ def list_drive_items(token, folder_id=None):
     except Exception as e:
         st.error(f"Graph error: {e}")
         return []
-
-
-def download_onedrive_file(token, file_id):
-    headers = {"Authorization": f"Bearer {token}"}
-
-    try:
-        url = f"https://graph.microsoft.com/v1.0/me/drive/items/{file_id}/content"
-        res = requests.get(url, headers=headers)
-
-        if res.status_code != 200:
-            return None
-
-        return res.content
-
-    except:
-        return None
 
 # ================= AI =================
 def call_ai(prompt, model):
@@ -198,51 +185,29 @@ if files:
     st.success("✅ Files added")
 
 # ================= GRAPH UI =================
-st.subheader("☁️ OneDrive Explorer")
+if graph_enabled:
+    st.subheader("☁️ OneDrive Explorer")
 
-if st.button("Connect Microsoft"):
-    token = get_graph_token()
-    if token:
-        st.session_state.graph_token = token
+    if st.button("Connect Microsoft"):
+        token = get_graph_token()
+        if token:
+            st.session_state.graph_token = token
 
-if "graph_token" in st.session_state:
+    if "graph_token" in st.session_state:
 
-    items = list_drive_items(
-        st.session_state.graph_token,
-        st.session_state.current_folder
-    )
+        items = list_drive_items(
+            st.session_state.graph_token,
+            st.session_state.current_folder
+        )
 
-    if st.session_state.folder_stack:
-        if st.button("⬅️ Back"):
-            st.session_state.current_folder = st.session_state.folder_stack.pop()
-            st.rerun()
+        for item in items:
+            name = item["name"]
+            item_id = item["id"]
 
-    for item in items:
-        name = item["name"]
-        item_id = item["id"]
-
-        if "folder" in item:
-            if st.button(f"📁 {name}", key=item_id):
-                st.session_state.folder_stack.append(st.session_state.current_folder)
-                st.session_state.current_folder = item_id
-                st.rerun()
-
-        else:
-            if st.button(f"📄 Load {name}", key=f"load_{item_id}"):
-
-                content = download_onedrive_file(
-                    st.session_state.graph_token,
-                    item_id
-                )
-
-                if content:
-                    try:
-                        text = content.decode("utf-8", "ignore")
-                    except:
-                        text = str(content)
-
-                    st.session_state.context += text
-                    st.success(f"Loaded {name}")
+            if "folder" in item:
+                if st.button(f"📁 {name}", key=item_id):
+                    st.session_state.current_folder = item_id
+                    st.rerun()
 
 # ================= CHAT =================
 st.subheader("💬 Chat")
