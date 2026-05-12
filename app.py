@@ -2,24 +2,22 @@ import os
 import re
 import msal
 import pandas as pd
+import numpy as np
 import streamlit as st
 from anthropic import Anthropic
 from docx import Document
 from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ================= CONFIG =================
-st.set_page_config(page_title="Enterprise AI Copilot", layout="wide")
-
-st.title("🚀 Enterprise AI Copilot (SSO + RAG + Memory)")
-st.caption("Production AI System")
+st.set_page_config(page_title="Enterprise Copilot Ultimate", layout="wide")
+st.title("🚀 Enterprise Copilot Ultimate (FAISS + Tools + Graph)")
 
 # ================= ENV =================
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 TENANT_ID = os.getenv("TENANT_ID")
-
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPES = ["User.Read"]
 
 if not ANTHROPIC_API_KEY:
     st.error("Missing API Key")
@@ -38,60 +36,22 @@ if "history" not in st.session_state:
 if "memory" not in st.session_state:
     st.session_state.memory = []
 
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = []
+if "documents" not in st.session_state:
+    st.session_state.documents = []
 
-# ================= LOGIN MODES =================
-USE_SSO = False  # ✅ Change to True when admin consent is available
+# ================= LOGIN =================
+if not st.session_state.auth:
+    st.subheader("🔐 Login")
+    user = st.text_input("Username")
+    pwd = st.text_input("Password", type="password")
 
-def microsoft_login():
-    try:
-        app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
-        flow = app.initiate_device_flow(scopes=SCOPES)
-
-        if "user_code" not in flow:
-            st.error("Login failed")
-            return
-
-        st.info(f"Go to {flow['verification_uri']}")
-        st.info(f"Enter code: {flow['user_code']}")
-
-        result = app.acquire_token_by_device_flow(flow)
-
-        if "access_token" in result:
+    if st.button("Login"):
+        if user == os.getenv("APP_USER", "admin") and pwd == os.getenv("APP_PASS", "admin123"):
             st.session_state.auth = True
-            st.session_state.user = result.get("id_token_claims", {}).get("name", "User")
+            st.session_state.user = user
             st.rerun()
         else:
-            st.error("Login failed")
-
-    except Exception as e:
-        st.error(f"SSO Error: {e}")
-
-# ================= LOGIN UI =================
-if not st.session_state.auth:
-
-    if USE_SSO:
-        st.subheader("🔐 Microsoft Login")
-        if st.button("Login with Microsoft"):
-            microsoft_login()
-
-    else:
-        st.subheader("🔐 Basic Login")
-
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-
-        VALID_USER = os.getenv("APP_USER", "admin")
-        VALID_PASS = os.getenv("APP_PASS", "admin123")
-
-        if st.button("Login"):
-            if username == VALID_USER and password == VALID_PASS:
-                st.session_state.auth = True
-                st.session_state.user = username
-                st.rerun()
-            else:
-                st.error("Invalid credentials")
+            st.error("Invalid credentials")
 
     st.stop()
 
@@ -110,92 +70,123 @@ def extract_file(file):
 
         if file.name.endswith((".xlsx", ".xls")):
             df = pd.read_excel(file, engine="openpyxl")
-            return df.to_string()
+            st.dataframe(df)
+            return df.to_csv(index=False)
 
         return file.read().decode("utf-8", "ignore")
 
     except:
         return ""
 
-# ================= RAG =================
-def chunk_text(text, size=500):
-    return [text[i:i+size] for i in range(0, len(text), size)]
-
-def store_chunks(text):
-    chunks = chunk_text(text)
-    st.session_state.vector_store.extend(chunks)
+# ================= VECTOR SEARCH =================
+def build_vector_store(texts):
+    vectorizer = TfidfVectorizer(stop_words="english")
+    vectors = vectorizer.fit_transform(texts)
+    return vectorizer, vectors
 
 def retrieve_context(query):
-    relevant = []
-    for chunk in st.session_state.vector_store:
-        if any(word in chunk.lower() for word in query.lower().split()):
-            relevant.append(chunk)
-    return "\n".join(relevant[:5])
+    if not st.session_state.documents:
+        return ""
+
+    texts = st.session_state.documents
+    vectorizer, vectors = build_vector_store(texts)
+
+    query_vec = vectorizer.transform([query])
+    similarity = cosine_similarity(query_vec, vectors).flatten()
+
+    top_idx = similarity.argsort()[-5:][::-1]
+    return "\n".join([texts[i] for i in top_idx])
+
+# ================= TOOL ENGINE =================
+def detect_tool(query):
+    q = query.lower()
+
+    if any(x in q for x in ["analyze", "summary", "statistics", "excel"]):
+        return "data_analysis"
+
+    if any(x in q for x in ["table", "format"]):
+        return "table"
+
+    return "none"
+
+def run_tool(tool, context):
+    if tool == "data_analysis":
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(context))
+            return df.describe().to_string()
+        except:
+            return None
+
+    return None
 
 # ================= PROMPT =================
 def build_prompt(query):
-    rag_context = retrieve_context(query)
+    context = retrieve_context(query)
 
-    memory_context = "\n".join(
+    memory = "\n".join(
         [f"{m['role']}: {m['content']}" for m in st.session_state.memory[-5:]]
     )
 
     return f"""
-You are an enterprise AI copilot.
+You are Enterprise Copilot.
 
-Conversation Memory:
-{memory_context}
+Memory:
+{memory}
 
-Retrieved Context:
-{rag_context}
+Context:
+{context}
 
-User Query:
+User:
 {query}
 
-Instructions:
-- Answer completely
-- NEVER stop mid-response
-- Continue automatically if needed
-- Provide structured output when useful
+Rules:
+- Provide FULL complete answer
+- Continue if needed
+- Use tables when relevant
+- Be structured and clear
 """
 
-# ================= AI =================
+# ================= STREAMING AI =================
 def call_ai(prompt):
-    final_output = ""
-    current_prompt = prompt
+    placeholder = st.empty()
+    full_text = ""
 
     for _ in range(5):
         try:
             res = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4000,
-                messages=[{"role": "user", "content": current_prompt}]
+                messages=[{"role": "user", "content": prompt}]
             )
 
-            chunk = res.content[0].text
-            final_output += chunk
+            text = res.content[0].text
+            full_text += text
 
-            if len(chunk) < 200:
+            placeholder.markdown(full_text)
+
+            if len(text) < 200:
                 break
 
-            current_prompt = "Continue exactly from where you stopped."
+            prompt = "Continue from previous response"
 
         except Exception as e:
-            return f"AI Error: {e}"
+            return f"Error: {e}"
 
-    return final_output
+    return full_text
 
 # ================= FILE UPLOAD =================
 st.subheader("📂 Upload Knowledge")
 
-files = st.file_uploader("Upload documents", accept_multiple_files=True)
+files = st.file_uploader("Upload files", accept_multiple_files=True)
 
 if files:
     for f in files:
         text = extract_file(f)
-        store_chunks(text)
+        chunks = [text[i:i+600] for i in range(0, len(text), 600)]
+        st.session_state.documents.extend(chunks)
 
-    st.success("✅ Knowledge Base Updated")
+    st.success("✅ Knowledge indexed")
 
 # ================= CHAT =================
 st.subheader("💬 Copilot Chat")
@@ -209,8 +200,29 @@ if query:
     st.session_state.history.append({"role": "user", "content": query})
     st.session_state.memory.append({"role": "user", "content": query})
 
-    prompt = build_prompt(query)
-    response = call_ai(prompt)
+    tool = detect_tool(query)
+
+    if tool != "none":
+        context = retrieve_context(query)
+        tool_result = run_tool(tool, context)
+
+        if tool_result:
+            response = tool_result
+        else:
+            prompt = build_prompt(query)
+            response = call_ai(prompt)
+    else:
+        prompt = build_prompt(query)
+        response = call_ai(prompt)
+
+    # ✅ Structured output rendering
+    try:
+        if response.strip().startswith("[{"):
+            import json
+            df = pd.DataFrame(json.loads(response))
+            st.dataframe(df)
+    except:
+        pass
 
     st.session_state.history.append({"role": "assistant", "content": response})
     st.session_state.memory.append({"role": "assistant", "content": response})
