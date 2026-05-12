@@ -19,15 +19,21 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 TENANT_ID = os.getenv("TENANT_ID")
 
+# ✅ Validation
 if not ANTHROPIC_API_KEY:
-    st.error("❌ Missing ANTHROPIC_API_KEY")
+    st.error("❌ Missing ANTHROPIC_API_KEY (check Streamlit Secrets)")
     st.stop()
 
 if not CLIENT_ID or not TENANT_ID:
-    st.error("❌ Missing CLIENT_ID or TENANT_ID")
+    st.error("❌ Missing CLIENT_ID or TENANT_ID (check Streamlit Secrets)")
     st.stop()
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
+# ✅ Safe init
+try:
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+except Exception as e:
+    st.error(f"❌ Failed to initialize AI client: {e}")
+    st.stop()
 
 # ================= SESSION =================
 if "auth" not in st.session_state:
@@ -96,7 +102,9 @@ def extract_file(file):
             return "\n".join(p.text for p in Document(file).paragraphs)
 
         if name.endswith(".pdf"):
-            return "\n".join(p.extract_text() for p in PdfReader(file).pages if p.extract_text())
+            return "\n".join(
+                p.extract_text() for p in PdfReader(file).pages if p.extract_text()
+            )
 
         if name.endswith((".xlsx", ".xls")):
             df = pd.read_excel(file, engine="openpyxl")
@@ -171,9 +179,10 @@ def call_ai(prompt, model):
         res = client.messages.create(
             model=model,
             max_tokens=4000,
-            messages=[{"role":"user","content":mask(prompt)}]
+            messages=[{"role": "user", "content": mask(prompt)}]
         )
         return res.content[0].text
+
     except Exception as e:
         return f"AI Error: {e}"
 
@@ -209,7 +218,6 @@ if "graph_token" in st.session_state:
             st.rerun()
 
     for item in items:
-
         name = item["name"]
         item_id = item["id"]
 
@@ -245,7 +253,7 @@ for msg in st.session_state.history:
 query = st.chat_input()
 
 if query:
-    st.session_state.history.append({"role":"user","content":query})
+    st.session_state.history.append({"role": "user", "content": query})
 
     prompt = f"""
 Context:
@@ -258,5 +266,5 @@ Query:
     model = choose_model(query, st.session_state.context)
     response = call_ai(prompt, model)
 
-    st.session_state.history.append({"role":"assistant","content":response})
+    st.session_state.history.append({"role": "assistant", "content": response})
     st.rerun()
