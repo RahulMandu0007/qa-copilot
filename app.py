@@ -1,6 +1,7 @@
 import os
 import re
 import msal
+import uuid
 import pandas as pd
 import requests
 import streamlit as st
@@ -9,116 +10,71 @@ from docx import Document
 from pypdf import PdfReader
 
 # ================= CONFIG =================
-st.set_page_config(page_title="Enterprise QA Copilot", layout="wide")
+st.set_page_config(page_title="Enterprise AI Copilot", layout="wide")
 
-st.title("🚀 Enterprise QA Copilot (Claude + AI)")
-st.caption("Chat + Files + Smart AI + Memory + Analytics")
+st.title("🚀 Enterprise AI Copilot (SSO + RAG + Memory)")
+st.caption("Production AI System")
 
 # ================= ENV =================
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 TENANT_ID = os.getenv("TENANT_ID")
 
-# ✅ Validate AI key
-if not ANTHROPIC_API_KEY:
-    st.error("❌ Missing ANTHROPIC_API_KEY")
-    st.stop()
-
-# ✅ Init AI
-try:
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-except Exception as e:
-    st.error(f"❌ AI Init Error: {e}")
-    st.stop()
-
-# ✅ Microsoft optional
-graph_enabled = True
-if not CLIENT_ID or not TENANT_ID:
-    graph_enabled = False
-    st.warning("⚠️ Microsoft integration disabled")
-
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPES = ["Files.Read"]
+SCOPES = ["User.Read"]
+
+if not ANTHROPIC_API_KEY:
+    st.error("Missing API Key")
+    st.stop()
+
+client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ================= SESSION =================
 if "auth" not in st.session_state:
     st.session_state.auth = False
-
-if "context" not in st.session_state:
-    st.session_state.context = ""
+    st.session_state.user = None
 
 if "history" not in st.session_state:
     st.session_state.history = []
 
-# ================= LOGIN (SECURE) =================
-VALID_USER = os.getenv("APP_USER", "admin")
-VALID_PASS = os.getenv("APP_PASS", "admin123")
+if "memory" not in st.session_state:
+    st.session_state.memory = []
 
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = []
+
+# ================= SSO LOGIN =================
+def microsoft_login():
+    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+
+    flow = app.initiate_device_flow(scopes=SCOPES)
+
+    if "user_code" not in flow:
+        st.error("Login failed")
+        return
+
+    st.info(f"Go to {flow['verification_uri']}")
+    st.info(f"Enter code: {flow['user_code']}")
+
+    result = app.acquire_token_by_device_flow(flow)
+
+    if "access_token" in result:
+        st.session_state.auth = True
+        st.session_state.user = result["id_token_claims"]["name"]
+        st.rerun()
+    else:
+        st.error("Login failed")
+
+# LOGIN UI
 if not st.session_state.auth:
-    st.subheader("🔐 Login")
-
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-
-    if st.button("Login"):
-        if u == VALID_USER and p == VALID_PASS:
-            st.session_state.auth = True
-            st.rerun()
-        else:
-            st.error("Invalid credentials")
-
+    st.subheader("🔐 Microsoft Login")
+    if st.button("Login with Microsoft"):
+        microsoft_login()
     st.stop()
 
-# ================= MODEL =================
-MODELS = {
-    "fast": "claude-haiku-4-5-20251001",
-    "balanced": "claude-sonnet-4-6",
-    "powerful": "claude-opus-4-7"
-}
+st.success(f"✅ Logged in as {st.session_state.user}")
 
-def choose_model(q, ctx):
-    if len(ctx) > 4000 or len(q) > 300:
-        return MODELS["powerful"]
-    elif len(q) < 80:
-        return MODELS["fast"]
-    return MODELS["balanced"]
-
-# ================= SMART INPUT DETECTION =================
-def detect_input_type(text):
-    text = text.lower()
-
-    if any(x in text for x in ["excel", "column", "row", "dataframe"]):
-        return "structured"
-    if any(x in text for x in ["pdf", "document", "summarize"]):
-        return "document"
-    if any(x in text for x in ["json", "{", "}"]):
-        return "json"
-    return "general"
-
-# ================= PROMPT BUILDER =================
-def build_prompt(query, context):
-    input_type = detect_input_type(query)
-
-    return f"""
-You are an enterprise AI copilot.
-
-Context:
-{context}
-
-User Query:
-{query}
-
-Input Type: {input_type}
-
-Instructions:
-- If structured → return table + insights
-- If document → summarize + key points
-- If general → clear explanation
-- NEVER stop mid response
-- Continue until fully complete
-"""
-
-# ================= FILE HANDLING =================
+# ================= FILE PARSER =================
 def extract_file(file):
     try:
         if file.name.endswith(".docx"):
@@ -126,7 +82,7 @@ def extract_file(file):
 
         if file.name.endswith(".pdf"):
             return "\n".join(
-                p.extract_text() for p in PdfReader(file.pages) if p.extract_text()
+                p.extract_text() for p in PdfReader(file).pages if p.extract_text()
             )
 
         if file.name.endswith((".xlsx", ".xls")):
@@ -138,78 +94,87 @@ def extract_file(file):
     except:
         return ""
 
-# ================= GRAPH API =================
-def get_graph_token():
-    try:
-        app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
-        flow = app.initiate_device_flow(scopes=SCOPES)
+# ================= RAG =================
+def chunk_text(text, size=500):
+    return [text[i:i+size] for i in range(0, len(text), size)]
 
-        if "user_code" not in flow:
-            st.error("❌ Login start failed")
-            return None
+def store_chunks(text):
+    chunks = chunk_text(text)
+    st.session_state.vector_store.extend(chunks)
 
-        st.info(f"👉 Open: {flow['verification_uri']}")
-        st.info(f"👉 Code: {flow['user_code']}")
+def retrieve_context(query):
+    relevant = []
+    for chunk in st.session_state.vector_store:
+        if any(word in chunk.lower() for word in query.lower().split()):
+            relevant.append(chunk)
 
-        result = app.acquire_token_by_device_flow(flow)
+    return "\n".join(relevant[:5])
 
-        return result.get("access_token")
+# ================= PROMPT ENGINE =================
+def build_prompt(query):
+    rag_context = retrieve_context(query)
+    conversation = "\n".join(
+        [f"{m['role']}: {m['content']}" for m in st.session_state.memory[-5:]]
+    )
 
-    except Exception as e:
-        st.error(f"Microsoft error: {e}")
-        return None
+    return f"""
+You are an enterprise AI copilot.
+
+Conversation Memory:
+{conversation}
+
+Retrieved Context:
+{rag_context}
+
+User Query:
+{query}
+
+Instructions:
+- Answer completely
+- Do not stop mid response
+- If needed, continue automatically
+"""
 
 # ================= AI ENGINE =================
-def call_ai(prompt, model):
-    output = ""
+def call_ai(prompt):
+    full_response = ""
     current_prompt = prompt
 
-    for _ in range(5):  # Continue loop
+    for _ in range(5):
         try:
             res = client.messages.create(
-                model=model,
+                model="claude-sonnet-4-6",
                 max_tokens=4000,
                 messages=[{"role": "user", "content": current_prompt}]
             )
 
             chunk = res.content[0].text
-            output += chunk
+            full_response += chunk
 
-            # Stop if small chunk
             if len(chunk) < 200:
                 break
 
-            current_prompt = "Continue exactly from where you stopped."
+            current_prompt = "Continue from where you stopped."
 
         except Exception as e:
-            return f"AI Error: {e}"
+            return f"Error: {e}"
 
-    return output
+    return full_response
 
 # ================= FILE UPLOAD =================
-st.subheader("📂 Upload Files")
+st.subheader("📂 Upload Knowledge")
 
-files = st.file_uploader("Upload", accept_multiple_files=True)
+files = st.file_uploader("Upload documents", accept_multiple_files=True)
 
 if files:
-    content = ""
     for f in files:
-        content += extract_file(f) + "\n"
+        content = extract_file(f)
+        store_chunks(content)
 
-    st.session_state.context = content
-    st.success("✅ Files added to context")
-
-# ================= GRAPH UI =================
-if graph_enabled:
-    st.subheader("☁️ OneDrive")
-
-    if st.button("Connect Microsoft"):
-        token = get_graph_token()
-        if token:
-            st.success("✅ Connected")
+    st.success("✅ Knowledge Base Updated")
 
 # ================= CHAT =================
-st.subheader("💬 Chat")
+st.subheader("💬 Copilot Chat")
 
 for msg in st.session_state.history:
     st.chat_message(msg["role"]).write(msg["content"])
@@ -218,11 +183,13 @@ query = st.chat_input("Ask anything...")
 
 if query:
     st.session_state.history.append({"role": "user", "content": query})
+    st.session_state.memory.append({"role": "user", "content": query})
 
-    prompt = build_prompt(query, st.session_state.context)
-    model = choose_model(query, st.session_state.context)
+    prompt = build_prompt(query)
 
-    response = call_ai(prompt, model)
+    response = call_ai(prompt)
 
     st.session_state.history.append({"role": "assistant", "content": response})
+    st.session_state.memory.append({"role": "assistant", "content": response})
+
     st.rerun()
